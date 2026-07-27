@@ -3,7 +3,7 @@ import type Index from '../../../@types/IndexType'
 import type Thought from '../../../@types/Thought'
 import type ThoughtId from '../../../@types/ThoughtId'
 import type Timestamp from '../../../@types/Timestamp'
-import { EM_TOKEN } from '../../../constants'
+import { EM_TOKEN, GLOBAL_ROOT_TOKEN } from '../../../constants'
 import treecrdtThoughtspace, { init as initTreecrdtThoughtspace } from '../thoughtspace'
 import { getTreecrdtClient, initTreecrdt } from '../treecrdt'
 
@@ -77,6 +77,7 @@ const persistFixture = async ({ movePlacements, thoughts }: ThoughtFixture): Pro
 /** Instruments TreeCRDT methods that cross the worker or SQLite boundary during batched reads. */
 const instrumentTreecrdtReads = (client: TreecrdtClient) => ({
   children: vi.spyOn(client.tree, 'children'),
+  exists: vi.spyOn(client.tree, 'exists'),
   getPayload: vi.spyOn(client.tree, 'getPayload'),
   parent: vi.spyOn(client.tree, 'parent'),
   sqlGetText: vi.spyOn(client.runner, 'getText'),
@@ -85,6 +86,7 @@ const instrumentTreecrdtReads = (client: TreecrdtClient) => ({
 /** Returns stable call counts from the TreeCRDT read instrumentation. */
 const readCallCounts = (spies: ReturnType<typeof instrumentTreecrdtReads>) => ({
   children: spies.children.mock.calls.length,
+  exists: spies.exists.mock.calls.length,
   getPayload: spies.getPayload.mock.calls.length,
   parent: spies.parent.mock.calls.length,
   sqlGetText: spies.sqlGetText.mock.calls.length,
@@ -104,7 +106,7 @@ afterEach(async () => {
 it.each([
   ['wide', wideFixture],
   ['deep', deepFixture],
-] as const)('characterizes TreeCRDT provider read calls for a %s fixture', async (_name, createFixture) => {
+] as const)('batches TreeCRDT provider reads for a %s fixture', async (_name, createFixture) => {
   const fixture = createFixture(FIXTURE_SIZE)
   await persistFixture(fixture)
   const readSpies = instrumentTreecrdtReads(getTreecrdtClient())
@@ -112,11 +114,87 @@ it.each([
   const result = await treecrdtThoughtspace.getThoughtsByIds(fixture.readIds)
 
   expect(result.map(current => current?.id)).toEqual(fixture.readIds)
-  // Characterize the current linear fan-out without imposing a wall-clock performance budget.
   expect(readCallCounts(readSpies)).toEqual({
-    children: FIXTURE_SIZE * 2,
-    getPayload: FIXTURE_SIZE,
-    parent: FIXTURE_SIZE,
-    sqlGetText: FIXTURE_SIZE,
+    children: 0,
+    exists: 1,
+    getPayload: 0,
+    parent: 0,
+    sqlGetText: 1,
+  })
+})
+
+it('preserves single-read semantics, caller order, duplicates, and missing thoughts', async () => {
+  const parent = thought(fixtureId(3000), EM_TOKEN, 'parent', 0)
+  const child = thought(fixtureId(3001), parent.id, 'child', 0)
+  const archived = { ...thought(fixtureId(3002), parent.id, 'archived', 1), archived: 2 as Timestamp }
+  const attribute = thought(fixtureId(3003), child.id, '=pin', 0)
+  const thoughts = [parent, child, archived, attribute]
+
+  await persistFixture({
+    thoughts,
+    readIds: thoughts.map(current => current.id),
+    movePlacements: {
+      [parent.id]: null,
+      [child.id]: null,
+      [archived.id]: child.id,
+      [attribute.id]: null,
+    },
+  })
+
+  const missingId = fixtureId(3999)
+  const readIds = [archived.id, missingId, child.id, archived.id, GLOBAL_ROOT_TOKEN]
+  const expected = await Promise.all(readIds.map(current => treecrdtThoughtspace.getThoughtById(current)))
+
+  await expect(treecrdtThoughtspace.getThoughtsByIds(readIds)).resolves.toEqual(expected)
+})
+
+it('avoids TreeCRDT boundary calls for an empty batch', async () => {
+  const readSpies = instrumentTreecrdtReads(getTreecrdtClient())
+
+  await expect(treecrdtThoughtspace.getThoughtsByIds([])).resolves.toEqual([])
+  expect(readCallCounts(readSpies)).toEqual({
+    children: 0,
+    exists: 0,
+    getPayload: 0,
+    parent: 0,
+    sqlGetText: 0,
+  })
+})
+
+it('preserves single-read semantics for deleted thoughts', async () => {
+  const parent = thought(fixtureId(4000), EM_TOKEN, 'parent', 0)
+  const child = thought(fixtureId(4001), parent.id, 'child', 0)
+  await persistFixture({
+    thoughts: [parent, child],
+    readIds: [child.id],
+    movePlacements: { [parent.id]: null, [child.id]: null },
+  })
+  await treecrdtThoughtspace.updateThoughts({
+    thoughtIndexUpdates: { [child.id]: null },
+    lexemeIndexUpdates: {},
+    lexemeIndexUpdatesOld: {},
+    schemaVersion: 0,
+  })
+
+  const expected = await treecrdtThoughtspace.getThoughtById(child.id)
+  await expect(treecrdtThoughtspace.getThoughtsByIds([child.id])).resolves.toEqual([expected])
+})
+
+it('preserves order across bounded SQLite batches', async () => {
+  const current = thought(fixtureId(5000), EM_TOKEN, 'repeated', 0)
+  await persistFixture({ thoughts: [current], readIds: [current.id], movePlacements: { [current.id]: null } })
+  const missingId = fixtureId(5001)
+  const readIds = Array.from({ length: 501 }, (_, index) => (index % 2 === 0 ? current.id : missingId))
+  const readSpies = instrumentTreecrdtReads(getTreecrdtClient())
+
+  const result = await treecrdtThoughtspace.getThoughtsByIds(readIds)
+
+  expect(result.map(thought => thought?.id)).toEqual(readIds.map(id => (id === current.id ? id : undefined)))
+  expect(readCallCounts(readSpies)).toEqual({
+    children: 0,
+    exists: 1,
+    getPayload: 0,
+    parent: 0,
+    sqlGetText: 2,
   })
 })

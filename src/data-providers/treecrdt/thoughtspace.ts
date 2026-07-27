@@ -32,6 +32,7 @@ import {
   tryStartTreecrdtWebSocketSyncFromEnv as tryStartTreecrdtWebSocketSync,
 } from './sync'
 import { SYSTEM_ROOT_THOUGHT_IDS } from './systemThoughtIds'
+import { getTreecrdtThoughtRows } from './thoughtReads'
 import { dropTreecrdt, getTreecrdtClient, registerBeforeTreecrdtClose } from './treecrdt'
 import { createTreecrdtLocalWriteOptions, isTreecrdtLocalMaterialization } from './writeBarrier'
 
@@ -130,7 +131,23 @@ const getThoughtById = async (id: ThoughtId): Promise<Thought | undefined> => {
 /** Fetches multiple thoughts by IDs. */
 const getThoughtsByIds = async (ids: ThoughtId[]): Promise<(Thought | undefined)[]> => {
   await waitForTestReplicationDelay()
-  return Promise.all(ids.map(getThoughtById))
+  const rows = await getTreecrdtThoughtRows(getTreecrdtClient(), ids)
+  return rows.map(row => {
+    if (!row) return undefined
+
+    const payload = decodeThoughtPayload(row.payload)
+    return {
+      id: row.id,
+      value: payload.value,
+      rank: row.rank,
+      created: payload.created as Timestamp,
+      lastUpdated: payload.lastUpdated as Timestamp,
+      updatedBy: payload.updatedBy,
+      parentId: row.parentId,
+      childrenMap: createIndexedChildrenMap(row.childIds, row.attributeValueByChildId),
+      ...(payload.archived !== undefined && { archived: payload.archived as Timestamp }),
+    }
+  })
 }
 
 /** Converts em's root parent id to TreeCRDT's global root id. */

@@ -8,7 +8,8 @@ import isAttribute from '../../util/isAttribute'
 import { decodeThoughtPayload } from './payload'
 
 /** Application-owned child value index used to restore em's attribute-keyed childrenMap contract. */
-const TABLE = 'em_attribute_children'
+export const ATTRIBUTE_CHILDREN_TABLE = 'em_attribute_children'
+const TABLE = ATTRIBUTE_CHILDREN_TABLE
 const META_TABLE = 'em_attribute_children_meta'
 const INDEX_VERSION = '1'
 const schemaReady = new WeakSet<TreecrdtClient>()
